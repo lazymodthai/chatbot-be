@@ -1,3 +1,5 @@
+# app/config.py
+
 from pydantic_settings import BaseSettings
 import os
 from dotenv import load_dotenv

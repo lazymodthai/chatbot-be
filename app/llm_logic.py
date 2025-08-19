@@ -1,13 +1,14 @@
-from langchain_community.vectorstores.pgvector import PGVector
+# app/llm_logic.py
+
+import locale
+from langchain_core.documents import Document
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.llms import Ollama
-from langchain.prompts import PromptTemplate
-from langchain.chains import ConversationalRetrievalChain
-from langchain_community.chat_message_histories import PostgresChatMessageHistory
-from langchain.memory import ConversationBufferMemory
-from langchain.schema import Document
-from datetime import datetime
-import locale
+from langchain_community.chat_message_histories import SQLChatMessageHistory
+from langchain_community.vectorstores.pgvector import PGVector
 
 from .config import settings, BOT_ROLE
 from .services import load_and_split_documents, split_text_into_docs
@@ -15,7 +16,7 @@ from .services import load_and_split_documents, split_text_into_docs
 try:
     locale.setlocale(locale.LC_TIME, 'th_TH.UTF-8')
 except locale.Error:
-    print("Locale th_TH.UTF-8 not supported, using default.")
+    print("Locale 'th_TH.UTF-8' not supported, using system default.")
 
 embeddings_model = OllamaEmbeddings(model="llama3")
 llm_model = Ollama(model="llama3")
@@ -26,7 +27,6 @@ vector_store = PGVector(
     collection_name=settings.COLLECTION_NAME,
 )
 
-# Template แบบง่าย ไม่มี now parameter
 template = """คุณคือ AI ผู้ช่วยที่ต้องสวมบทบาทต่อไปนี้: '{bot_role}'
 คุณต้องตอบคำถามเป็นภาษาไทยเท่านั้น
 จงใช้ข้อมูลที่ให้มาต่อไปนี้เพื่อตอบคำถามของผู้ใช้ หากข้อมูลไม่เกี่ยวข้องหรือไม่เพียงพอ ให้ใช้ความรู้ทั่วไปของคุณในการสนทนาอย่างเป็นมิตรตามบทบาทที่ได้รับ
@@ -34,7 +34,7 @@ template = """คุณคือ AI ผู้ช่วยที่ต้อง�
 หากไม่มีข้อมูลในเอกสาร ให้ตอบว่า "ขออภัยค่ะ/ครับ ดิฉัน/ผมไม่มีข้อมูลเกี่ยวกับเรื่องนี้ในเอกสารที่ได้รับมา"
 หากเป็นข้อมูลความรู้ทั่วไปให้ตอบได้เลย (อาจหาข้อมูลจาก google)
 ตอบให้กระชับที่สุดเท่าที่เป็นไปได้ และจบด้วยการถามต่อว่าต้องการข้อมูลใดอีกไหม
-คุณอยู่ในประเทศไทย
+คุณอยู่ในประเทศไทย และวันนี้คือ {now}.
 
 ข้อมูลที่เกี่ยวข้องจากเอกสาร:
 {context}
@@ -43,18 +43,29 @@ template = """คุณคือ AI ผู้ช่วยที่ต้อง�
 {chat_history}
 
 คำถามของผู้ใช้: {question}
-
 คำตอบของคุณ (เป็นภาษาไทยเท่านั้น และเป็นรูปแบบ html ที่มีการจัดเรียงที่สวยงาม):"""
 
-prompt = PromptTemplate(template=template, input_variables=["context", "chat_history", "question", "bot_role"])
-CUSTOM_QUESTION_PROMPT = prompt.partial(bot_role=BOT_ROLE)
+base_prompt = PromptTemplate(
+    template=template, 
+    input_variables=["context", "chat_history", "question", "bot_role", "now"]
+)
+
 
 def get_chat_history(session_id: str):
-    return PostgresChatMessageHistory(
-        connection_string=settings.DATABASE_URL, session_id=session_id
+    """
+    สร้าง History object โดยใช้ SQLChatMessageHistory ซึ่งจัดการ connection เอง
+    """
+    return SQLChatMessageHistory(
+        session_id=session_id,
+        connection_string=settings.DATABASE_URL,
+        table_name="chat_history"
     )
 
-def create_conversational_chain(session_id: str):
+def create_conversational_chain(session_id: str, now_str: str):
+    """
+    สร้าง Chain โดยผนวก now_str เข้าไปใน Prompt แบบไดนามิก
+    """
+    dynamic_prompt = base_prompt.partial(bot_role=BOT_ROLE, now=now_str)
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         chat_memory=get_chat_history(session_id),
@@ -64,10 +75,11 @@ def create_conversational_chain(session_id: str):
         llm=llm_model,
         retriever=vector_store.as_retriever(),
         memory=memory,
-        combine_docs_chain_kwargs={"prompt": CUSTOM_QUESTION_PROMPT},
+        combine_docs_chain_kwargs={"prompt": dynamic_prompt},
     )
     return chain
 
+# --- ฟังก์ชันอื่นๆ ไม่เปลี่ยนแปลง ---
 def add_new_documents_to_db():
     docs = load_and_split_documents()
     if docs:
