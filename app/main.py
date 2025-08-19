@@ -13,7 +13,7 @@ from sqlalchemy import text
 from .database import engine, metadata, chat_history_table
 from .config import HELLO_MESSAGE, settings
 from .llm_logic import (add_new_documents_to_db, add_qa_to_db, add_text_to_db,
-                          create_conversational_chain, get_chat_history)
+                          create_conversational_chain, get_chat_history, add_correction_to_db)
 
 app = FastAPI(
     title="AI Chatbot Backend",
@@ -63,10 +63,8 @@ async def websocket_endpoint(
             if message_type == "question":
                 now_str = datetime.now().strftime('%d %B %Y')
                 
-                # สร้าง Chain ใหม่ทุกครั้งที่รับข้อความ เพื่อความเสถียร
                 chain = await run_in_threadpool(create_conversational_chain, current_session_id, now_str)
                 
-                # เรียก invoke โดยส่งเฉพาะ question
                 result = await run_in_threadpool(chain.invoke, {"question": question})
                 answer = result["answer"]
 
@@ -101,8 +99,6 @@ def _get_formatted_history_sync(session_id: str):
     formatted_messages = []
     for msg in history.messages:
         sender = 'user' if msg.type == 'human' else 'ai'
-        # content ของ SQLChatMessageHistory เป็น string ที่ต้อง decode
-        # แต่ในกรณีนี้ langchain อาจจัดการให้แล้ว ถ้าไม่ ให้ใช้ json.loads(msg.content)
         formatted_messages.append({"sender": sender, "text": msg.content})
     return formatted_messages
 
@@ -131,7 +127,6 @@ async def get_sessions(user_email: str):
             return []
     return await run_in_threadpool(_get_sessions_sync)
 
-# --- Endpoint ที่เหลือไม่มีการเปลี่ยนแปลง ---
 @app.post("/uploadfile/")
 async def upload_file(file: UploadFile):
     def _save_file_and_learn():
@@ -151,3 +146,17 @@ async def add_text(data: dict):
         return {"error": "No text provided."}
     await run_in_threadpool(add_text_to_db, text)
     return {"info": "Text processed and learned."}
+
+@app.post("/correct-answer/")
+async def correct_answer(data: dict):
+    """
+    รับคำตอบที่แก้ไขโดยผู้ใช้และนำไปให้ AI เรียนรู้
+    """
+    question = data.get("question")
+    corrected_answer = data.get("corrected_answer")
+    
+    if not question or not corrected_answer:
+        return {"error": "Question and corrected_answer are required."}
+        
+    await run_in_threadpool(add_correction_to_db, question, corrected_answer)
+    return {"info": "Thank you! The correction has been learned."}
