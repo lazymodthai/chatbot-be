@@ -5,10 +5,11 @@ import shutil
 import uuid
 from datetime import datetime
 
-from fastapi import (FastAPI, Query, UploadFile, WebSocket, WebSocketDisconnect)
+from fastapi import (FastAPI, Query, UploadFile, WebSocket, WebSocketDisconnect, HTTPException)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
+from pydantic import BaseModel
 
 from .database import engine, metadata, chat_history_table
 from .config import HELLO_MESSAGE, settings
@@ -20,6 +21,20 @@ app = FastAPI(
     description="Backend services for the AI Chatbot with session management and data ingestion.",
     version="1.0.0"
 )
+
+class TextData(BaseModel):
+    text: str
+
+class CorrectionData(BaseModel):
+    question: str
+    corrected_answer: str
+
+class RatingData(BaseModel):
+    question: str
+    answer: str
+    rating: str
+    session_id: str
+
 
 @app.on_event("startup")
 def on_startup():
@@ -80,7 +95,6 @@ async def websocket_endpoint(
                         print(f"Could not update user_email for session {current_session_id}: {e}")
                 
                 await run_in_threadpool(update_user_email_sync)
-                await run_in_threadpool(add_qa_to_db, question, answer)
                 
                 await websocket.send_json({"type": "answer", "answer": answer})
 
@@ -140,23 +154,39 @@ async def upload_file(file: UploadFile):
     return await run_in_threadpool(_save_file_and_learn)
 
 @app.post("/add-text/")
-async def add_text(data: dict):
-    text = data.get("text")
-    if not text:
-        return {"error": "No text provided."}
-    await run_in_threadpool(add_text_to_db, text)
+async def add_text(data: TextData):
+    await run_in_threadpool(add_text_to_db, data.text, source="manual_text", category="general")
     return {"info": "Text processed and learned."}
 
 @app.post("/correct-answer/")
-async def correct_answer(data: dict):
-    """
-    รับคำตอบที่แก้ไขโดยผู้ใช้และนำไปให้ AI เรียนรู้
-    """
-    question = data.get("question")
-    corrected_answer = data.get("corrected_answer")
-    
-    if not question or not corrected_answer:
-        return {"error": "Question and corrected_answer are required."}
-        
-    await run_in_threadpool(add_correction_to_db, question, corrected_answer)
+async def correct_answer(data: CorrectionData):
+    await run_in_threadpool(add_correction_to_db, data.question, data.corrected_answer)
     return {"info": "Thank you! The correction has been learned."}
+
+@app.post("/rate-answer/")
+async def rate_answer(data: RatingData):
+    """
+    Handles user feedback (like/dislike) for an AI's answer.
+    - 'like': Learns the Q&A pair as a good example.
+    - 'dislike': Generates a new answer for the original question.
+    """
+    if data.rating == "like":
+        await run_in_threadpool(add_qa_to_db, data.question, data.answer)
+        return {"info": "ขอบคุณสำหรับความคิดเห็นค่ะ AI ได้เรียนรู้คำตอบนี้แล้ว"}
+
+    elif data.rating == "dislike":
+        print(f"Received dislike for question: '{data.question}'. Generating a new answer.")
+        
+        new_question = f"สำหรับคำถาม '{data.question}', คำตอบที่เคยให้ว่า '{data.answer}' นั้นไม่ถูกต้อง ช่วยหาคำตอบที่ถูกต้องและแตกต่างจากเดิมให้หน่อยค่ะ"
+        
+        now_str = datetime.now().strftime('%d %B %Y')
+        
+        chain = await run_in_threadpool(create_conversational_chain, data.session_id, now_str)
+        
+        result = await run_in_threadpool(chain.invoke, {"question": new_question})
+        new_answer = result.get("answer", "ขออภัยค่ะ ขณะนี้ระบบไม่สามารถสร้างคำตอบใหม่ได้")
+
+        return {"new_answer": new_answer}
+
+    else:
+        raise HTTPException(status_code=400, detail="Invalid rating type. Use 'like' or 'dislike'.")
